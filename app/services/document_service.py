@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.models.chat_history import ChatHistory
 from app.models.document import Document
 from app.models.user import User
+from app.services.cloudinary_service import cloudinary_service
 from app.services.vector_store import vector_store
 
 
@@ -74,7 +75,9 @@ class DocumentService:
 
         items: list[DocumentSummaryItem] = []
         for document in documents:
-            file_size = os.path.getsize(document.file_path) if os.path.exists(document.file_path) else 0
+            file_size = document.file_size or 0
+            if not file_size and document.file_path and os.path.exists(document.file_path):
+                file_size = os.path.getsize(document.file_path)
             items.append(
                 DocumentSummaryItem(
                     id=document.id,
@@ -97,7 +100,7 @@ class DocumentService:
         return DocumentDetailItem(
             id=document.id,
             title=document.title,
-            file_path=document.file_path,
+            file_path=document.cloudinary_url or document.file_path or "",
             upload_date=document.uploaded_at.isoformat() if document.uploaded_at else "",
             summary=document.summary,
             text_length=len(document.extracted_text or ""),
@@ -110,17 +113,24 @@ class DocumentService:
             user,
         )
 
-        vector_store.delete_document_chunks(document.id)
-        db.query(ChatHistory).filter(ChatHistory.document_id == document.id).delete(synchronize_session=False)
+        try:
+            if document.cloudinary_public_id:
+                delete_result = cloudinary_service.delete_pdf(document.cloudinary_public_id)
+                if not delete_result.success:
+                    raise RuntimeError(delete_result.error or "Failed to delete Cloudinary PDF")
+            elif document.file_path and os.path.exists(document.file_path):
+                try:
+                    os.remove(document.file_path)
+                except OSError:
+                    logger.warning("Failed to remove legacy uploaded PDF", extra={"document_id": document.id, "path": document.file_path})
 
-        if document.file_path and os.path.exists(document.file_path):
-            try:
-                os.remove(document.file_path)
-            except OSError:
-                logger.warning("Failed to remove uploaded PDF", extra={"document_id": document.id, "path": document.file_path})
-
-        db.delete(document)
-        db.commit()
+            vector_store.delete_document_chunks(document.id)
+            db.query(ChatHistory).filter(ChatHistory.document_id == document.id).delete(synchronize_session=False)
+            db.delete(document)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
     def get_history(self, db: Session, user: User, document_id: int) -> list[ChatHistory]:
         document = self._ensure_document_owned(

@@ -1,6 +1,4 @@
-import os
 from pathlib import Path
-from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Path as ApiPath, Query, UploadFile
 from sqlalchemy.orm import Session
@@ -17,6 +15,7 @@ from app.schemas.document_schema import (
     DocumentDetailResponse,
     DocumentListItem,
 )
+from app.services.cloudinary_service import cloudinary_service
 from app.services.chat_service import chat_service
 from app.services.ai_service import gemini_summary_service
 from app.services.document_service import document_service
@@ -29,17 +28,6 @@ router = APIRouter(
 )
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
-
-
-def _validated_pdf_path(file: UploadFile, upload_dir: str) -> str:
-    original_name = Path(file.filename or "").name
-    if not original_name:
-        raise HTTPException(status_code=400, detail="Uploaded file must have a filename")
-
-    if Path(original_name).suffix.lower() != ".pdf":
-        raise HTTPException(status_code=400, detail="Only PDF uploads are supported")
-
-    return os.path.join(upload_dir, f"{uuid4().hex}_{original_name}")
 
 
 @router.get("", response_model=list[DocumentListItem])
@@ -93,45 +81,47 @@ async def upload_document(
     db: Session = Depends(get_db)
 ):
 
-    upload_dir = "uploads"
-
-    os.makedirs(
-        upload_dir,
-        exist_ok=True
-    )
-
-    file_location = _validated_pdf_path(file, upload_dir)
-
     content = await file.read()
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="PDF upload exceeds the 25 MB limit")
-    if not content.startswith(b"%PDF"):
-        raise HTTPException(status_code=400, detail="Uploaded file is not a valid PDF")
 
-    with open(
-        file_location,
-        "wb"
-    ) as buffer:
-        buffer.write(content)
+    validation_result = cloudinary_service.validate_pdf_upload(file.filename, content, MAX_UPLOAD_BYTES)
+    if not validation_result.success:
+        raise HTTPException(
+            status_code=validation_result.status_code,
+            detail={
+                "error": validation_result.error,
+                "error_type": validation_result.error_type,
+            },
+        )
+
+    upload_result = cloudinary_service.upload_pdf(file.filename, content, MAX_UPLOAD_BYTES)
+    if not upload_result.success:
+        raise HTTPException(
+            status_code=upload_result.status_code,
+            detail={
+                "error": upload_result.error,
+                "error_type": upload_result.error_type,
+            },
+        )
 
     try:
-        pages = extract_pages_from_pdf(
-            file_location
-        )
+        pages = extract_pages_from_pdf(content)
     except Exception as exc:
-        if os.path.exists(file_location):
-            os.remove(file_location)
+        if upload_result.public_id:
+            cloudinary_service.delete_pdf(upload_result.public_id)
         raise HTTPException(status_code=400, detail="Could not extract text from PDF") from exc
 
     text = "\n".join(page.text for page in pages)
     if not text.strip():
-        if os.path.exists(file_location):
-            os.remove(file_location)
+        if upload_result.public_id:
+            cloudinary_service.delete_pdf(upload_result.public_id)
         raise HTTPException(status_code=400, detail="PDF does not contain extractable text")
 
     document = Document(
-        title=Path(file.filename or file_location).name,
-        file_path=file_location,
+        title=Path(file.filename or upload_result.secure_url or "document.pdf").name,
+        file_path=upload_result.secure_url or "",
+        cloudinary_url=upload_result.secure_url,
+        cloudinary_public_id=upload_result.public_id,
+        file_size=upload_result.file_size,
         extracted_text=text,
         user_id=current_user.id
     )
@@ -158,8 +148,8 @@ async def upload_document(
             document_service.delete_document(db, current_user, document.id)
         except Exception:
             db.rollback()
-            if os.path.exists(file_location):
-                os.remove(file_location)
+            if upload_result.public_id:
+                cloudinary_service.delete_pdf(upload_result.public_id)
         raise HTTPException(
             status_code=502,
             detail={

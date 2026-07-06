@@ -11,3 +11,4 @@ bcrypt==4.0.1
 pymupdf
 google-genai
 chromadb
+cloudinary

@@ -18,6 +18,9 @@ class Settings:
     rag_chunk_overlap: int = int(os.getenv("RAG_CHUNK_OVERLAP", "200"))
     rag_top_k: int = int(os.getenv("RAG_TOP_K", "4"))
     rag_persist_directory: str = os.getenv("CHROMA_PERSIST_DIR", ".chroma")
+    cloudinary_cloud_name: str | None = os.getenv("CLOUDINARY_CLOUD_NAME")
+    cloudinary_api_key: str | None = os.getenv("CLOUDINARY_API_KEY")
+    cloudinary_api_secret: str | None = os.getenv("CLOUDINARY_API_SECRET")
 
 
 settings = Settings()
