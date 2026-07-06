@@ -1,0 +1,312 @@
+import os
+from pathlib import Path
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, File, HTTPException, Path as ApiPath, Query, UploadFile
+from sqlalchemy.orm import Session
+
+from app.core.dependencies import get_current_user
+from app.database.db import get_db
+from app.models.document import Document
+from app.models.user import User
+from app.schemas.chat_schema import ChatRequest, ChatHistoryResponse
+from app.schemas.document_schema import (
+    DashboardResponse,
+    DashboardLatestUpload,
+    DocumentDeleteResponse,
+    DocumentDetailResponse,
+    DocumentListItem,
+)
+from app.services.chat_service import chat_service
+from app.services.ai_service import gemini_summary_service
+from app.services.document_service import document_service
+from app.services.pdf_service import extract_pages_from_pdf
+from app.services.rag_service import DocumentPage, rag_service
+
+router = APIRouter(
+    prefix="/documents",
+    tags=["Documents"]
+)
+
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
+def _validated_pdf_path(file: UploadFile, upload_dir: str) -> str:
+    original_name = Path(file.filename or "").name
+    if not original_name:
+        raise HTTPException(status_code=400, detail="Uploaded file must have a filename")
+
+    if Path(original_name).suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="Only PDF uploads are supported")
+
+    return os.path.join(upload_dir, f"{uuid4().hex}_{original_name}")
+
+
+@router.get("", response_model=list[DocumentListItem])
+def list_documents(
+    search: str | None = Query(default=None, description="Filter documents by title"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    return document_service.list_user_documents(db, current_user, search=search)
+
+
+@router.get("/dashboard", response_model=DashboardResponse)
+def dashboard(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    dashboard_data = document_service.get_dashboard(db, current_user)
+    return DashboardResponse(
+        total_documents=dashboard_data.total_documents,
+        total_chats=dashboard_data.total_chats,
+        total_summaries=dashboard_data.total_summaries,
+        latest_uploads=[
+            DashboardLatestUpload(
+                id=upload.id,
+                title=upload.title,
+                upload_date=upload.upload_date,
+            )
+            for upload in dashboard_data.latest_uploads
+        ],
+    )
+
+
+@router.get("/{document_id}", response_model=DocumentDetailResponse)
+def get_document_details(
+    document_id: int = ApiPath(..., gt=0),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        return document_service.get_document(db, current_user, document_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@router.post("/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+
+    upload_dir = "uploads"
+
+    os.makedirs(
+        upload_dir,
+        exist_ok=True
+    )
+
+    file_location = _validated_pdf_path(file, upload_dir)
+
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="PDF upload exceeds the 25 MB limit")
+    if not content.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid PDF")
+
+    with open(
+        file_location,
+        "wb"
+    ) as buffer:
+        buffer.write(content)
+
+    try:
+        pages = extract_pages_from_pdf(
+            file_location
+        )
+    except Exception as exc:
+        if os.path.exists(file_location):
+            os.remove(file_location)
+        raise HTTPException(status_code=400, detail="Could not extract text from PDF") from exc
+
+    text = "\n".join(page.text for page in pages)
+    if not text.strip():
+        if os.path.exists(file_location):
+            os.remove(file_location)
+        raise HTTPException(status_code=400, detail="PDF does not contain extractable text")
+
+    document = Document(
+        title=Path(file.filename or file_location).name,
+        file_path=file_location,
+        extracted_text=text,
+        user_id=current_user.id
+    )
+
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+
+    try:
+        rag_service.index_document(
+            document_id=document.id,
+            document_title=document.title,
+            pages=[
+                DocumentPage(
+                    page_number=page.page_number,
+                    text=page.text,
+                )
+                for page in pages
+            ]
+        )
+    except Exception as exc:
+        vector_error_type = type(exc).__name__
+        try:
+            document_service.delete_document(db, current_user, document.id)
+        except Exception:
+            db.rollback()
+            if os.path.exists(file_location):
+                os.remove(file_location)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "Failed to index document for chat retrieval.",
+                "error_type": vector_error_type,
+            }
+        ) from exc
+
+    return {
+        "message": "Upload successful",
+        "document_id": document.id
+    }
+
+
+@router.post("/{document_id}/summarize")
+def summarize_document(
+    document_id: int = ApiPath(..., gt=0),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    document = db.query(Document).filter(
+        Document.id == document_id
+    ).first()
+
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found"
+        )
+
+    if document.user_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have access to this document"
+        )
+
+    if not document.extracted_text or not document.extracted_text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Document does not contain extracted text"
+        )
+
+    result = gemini_summary_service.generate_summary(
+        document.extracted_text,
+        document.title
+    )
+
+    if not result.success:
+        raise HTTPException(
+            status_code=result.status_code,
+            detail={
+                "error": result.error,
+                "error_type": result.error_type,
+            }
+        )
+
+    document.summary = result.summary
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+
+    return {
+        "message": "Summary generated successfully",
+        "document_id": document.id,
+        "summary": document.summary
+    }
+
+
+@router.post("/{document_id}/chat")
+def chat_with_document(
+    payload: ChatRequest,
+    document_id: int = ApiPath(..., gt=0),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    document = db.query(Document).filter(
+        Document.id == document_id
+    ).first()
+
+    result = chat_service.answer_question(
+        document=document,
+        current_user=current_user,
+        question=payload.question,
+        db=db,
+    )
+
+    if not result.success:
+        raise HTTPException(
+            status_code=result.status_code,
+            detail={
+                "error": result.error,
+                "error_type": result.error_type,
+            }
+        )
+
+    return {
+        "answer": result.answer,
+        "source_pages": result.source_pages or [],
+        "retrieved_chunks": [
+            {
+                "page_number": chunk.page_number,
+                "chunk_preview": chunk.chunk_preview,
+                "distance": chunk.distance,
+            }
+            for chunk in (result.retrieved_chunks or [])
+        ],
+        "citations": [f"p. {page}" for page in (result.source_pages or [])],
+    }
+
+
+@router.get("/{document_id}/history", response_model=list[ChatHistoryResponse])
+def get_document_history(
+    document_id: int = ApiPath(..., gt=0),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        history = document_service.get_history(db, current_user, document_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    return [
+        ChatHistoryResponse(
+            id=item.id,
+            document_id=item.document_id,
+            question=item.question,
+            answer=item.answer,
+            created_at=item.created_at.isoformat() if item.created_at else "",
+        )
+        for item in history
+    ]
+
+
+@router.delete("/{document_id}", response_model=DocumentDeleteResponse)
+def delete_document(
+    document_id: int = ApiPath(..., gt=0),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        document_service.delete_document(db, current_user, document_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    return {"message": "Document deleted successfully"}
+

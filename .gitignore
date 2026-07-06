@@ -1,0 +1,36 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Environment Variables
+.env
+.env.local
+
+# Frontend
+ai-study-assistant/node_modules/
+ai-study-assistant/.next/
+ai-study-assistant/out/
+
+# Logs
+*.log
+backend-*.log
+frontend-*.log
+
+# Uploaded Files
+uploads/
+
+# ChromaDB
+.chroma/
+chroma_test_tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Python cache
+.pytest_cache/
+.mypy_cache/

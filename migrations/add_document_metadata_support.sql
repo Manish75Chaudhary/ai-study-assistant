@@ -1,0 +1,2 @@
+-- Optional helper migration for existing installations that need metadata support.
+-- Current application code computes metadata dynamically, so no schema changes are required.
