@@ -48,6 +48,17 @@ export default function UploadPage() {
   const [localError, setLocalError] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const uploadStatusText = !file
+    ? null
+    : uploadDocument.isPending
+      ? uploadProgress >= 100
+        ? "Extracting text, creating the AI search index, and finalizing the upload."
+        : uploadProgress > 0
+          ? "Uploading document..."
+          : "Preparing document..."
+      : uploadProgress > 0
+        ? "Finalizing upload..."
+        : "Preparing document...";
 
   function selectFile(nextFile: File | null) {
     setUploadProgress(0);
@@ -210,11 +221,14 @@ export default function UploadPage() {
               {uploadDocument.isPending || uploadProgress > 0 ? (
                 <div className="mt-5">
                   <div className="flex items-center justify-between text-xs text-slate-400">
-                    <span>
-                      {uploadProgress >= 100 ? "Processing document" : "Uploading document"}
-                    </span>
+                    <span>{uploadStatusText}</span>
                     <span>{uploadProgress}%</span>
                   </div>
+                  <p className="mt-2 text-xs leading-5 text-slate-500">
+                    {uploadProgress >= 100
+                      ? "The file is on the server while text extraction and indexing finish."
+                      : "We are sending the file to the server."}
+                  </p>
                   <div className="mt-2 h-2 overflow-hidden rounded-full bg-white/[0.08]">
                     <div
                       className="h-full rounded-full bg-cyan-300 transition-all"

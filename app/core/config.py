@@ -16,6 +16,13 @@ class Settings:
     gemini_timeout_seconds: int = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "60"))
     rag_chunk_size: int = int(os.getenv("RAG_CHUNK_SIZE", "1200"))
     rag_chunk_overlap: int = int(os.getenv("RAG_CHUNK_OVERLAP", "200"))
+    rag_max_document_chunks: int = int(os.getenv("RAG_MAX_DOCUMENT_CHUNKS", "200"))
+    rag_max_document_text_length: int = int(
+        os.getenv(
+            "RAG_MAX_DOCUMENT_TEXT_LENGTH",
+            str(rag_chunk_size * rag_max_document_chunks),
+        )
+    )
     rag_top_k: int = int(os.getenv("RAG_TOP_K", "4"))
     rag_persist_directory: str = os.getenv("CHROMA_PERSIST_DIR", ".chroma")
     cloudinary_cloud_name: str | None = os.getenv("CLOUDINARY_CLOUD_NAME")

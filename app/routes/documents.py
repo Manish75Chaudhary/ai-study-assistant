@@ -1,9 +1,11 @@
 import logging
 from pathlib import Path
 
+import fitz
 from fastapi import APIRouter, Depends, File, HTTPException, Path as ApiPath, Query, UploadFile
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.dependencies import get_current_user
 from app.database.db import get_db
 from app.models.document import Document
@@ -21,7 +23,6 @@ from app.services.chat_service import chat_service
 from app.services.ai_service import gemini_summary_service
 from app.services.embedding_service import GeminiEmbeddingError
 from app.services.document_service import document_service
-from app.services.pdf_service import extract_pages_from_pdf
 from app.services.rag_service import DocumentPage, rag_service
 
 router = APIRouter(
@@ -32,6 +33,11 @@ router = APIRouter(
 logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+UNSUPPORTED_PDF_MESSAGE = "This PDF is damaged or unsupported."
+PASSWORD_PROTECTED_PDF_MESSAGE = "This PDF is password protected."
+EMPTY_PDF_MESSAGE = "This PDF contains no readable text."
+SCANNED_PDF_MESSAGE = "This PDF appears to be scanned or image-based. Please upload a text-based PDF."
+TOO_LARGE_PDF_MESSAGE = "This document is too large to process. Please upload a smaller PDF."
 GEMINI_ERROR_TYPES = {
     "quota_exhausted",
     "timeout_error",
@@ -39,6 +45,59 @@ GEMINI_ERROR_TYPES = {
     "gemini_api_error",
     "empty_response",
 }
+
+
+def _cleanup_uploaded_pdf(public_id: str | None) -> None:
+    if public_id:
+        cloudinary_service.delete_pdf(public_id)
+
+
+def _is_truthy_document_flag(document: fitz.Document, attribute_name: str) -> bool:
+    flag = getattr(document, attribute_name, False)
+    return bool(flag() if callable(flag) else flag)
+
+
+def _extract_validated_pdf_pages(content: bytes) -> list[DocumentPage]:
+    try:
+        document = fitz.open(stream=content, filetype="pdf")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=UNSUPPORTED_PDF_MESSAGE) from exc
+
+    try:
+        if _is_truthy_document_flag(document, "needs_pass") or _is_truthy_document_flag(document, "is_encrypted"):
+            authenticate = getattr(document, "authenticate", None)
+            if not callable(authenticate) or not authenticate(""):
+                raise HTTPException(status_code=400, detail=PASSWORD_PROTECTED_PDF_MESSAGE)
+
+        pages: list[DocumentPage] = []
+        has_text = False
+        has_images = False
+
+        for page_index, page in enumerate(document, start=1):
+            page_text = page.get_text().strip()
+            page_images = page.get_images(full=True)
+            pages.append(
+                DocumentPage(
+                    page_number=page_index,
+                    text=page_text,
+                )
+            )
+            has_text = has_text or bool(page_text)
+            has_images = has_images or bool(page_images)
+
+        if not pages or not has_text:
+            raise HTTPException(
+                status_code=400,
+                detail=SCANNED_PDF_MESSAGE if has_images else EMPTY_PDF_MESSAGE,
+            )
+
+        return pages
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=UNSUPPORTED_PDF_MESSAGE) from exc
+    finally:
+        document.close()
 
 
 @router.get("", response_model=list[DocumentListItem])
@@ -91,57 +150,58 @@ async def upload_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-
-    content = await file.read()
-
-    validation_result = cloudinary_service.validate_pdf_upload(file.filename, content, MAX_UPLOAD_BYTES)
-    if not validation_result.success:
-        raise HTTPException(
-            status_code=validation_result.status_code,
-            detail={
-                "error": validation_result.error,
-                "error_type": validation_result.error_type,
-            },
-        )
-
-    upload_result = cloudinary_service.upload_pdf(file.filename, content, MAX_UPLOAD_BYTES)
-    if not upload_result.success:
-        raise HTTPException(
-            status_code=upload_result.status_code,
-            detail={
-                "error": upload_result.error,
-                "error_type": upload_result.error_type,
-            },
-        )
+    upload_result = None
+    document = None
 
     try:
-        pages = extract_pages_from_pdf(content)
-    except Exception as exc:
-        if upload_result.public_id:
-            cloudinary_service.delete_pdf(upload_result.public_id)
-        raise HTTPException(status_code=400, detail="Could not extract text from PDF") from exc
+        content = await file.read()
 
-    text = "\n".join(page.text for page in pages)
-    if not text.strip():
-        if upload_result.public_id:
-            cloudinary_service.delete_pdf(upload_result.public_id)
-        raise HTTPException(status_code=400, detail="PDF does not contain extractable text")
+        validation_result = cloudinary_service.validate_pdf_upload(file.filename, content, MAX_UPLOAD_BYTES)
+        if not validation_result.success:
+            raise HTTPException(
+                status_code=validation_result.status_code,
+                detail={
+                    "error": validation_result.error,
+                    "error_type": validation_result.error_type,
+                },
+            )
 
-    document = Document(
-        title=Path(file.filename or upload_result.secure_url or "document.pdf").name,
-        file_path=upload_result.secure_url or "",
-        cloudinary_url=upload_result.secure_url,
-        cloudinary_public_id=upload_result.public_id,
-        file_size=upload_result.file_size,
-        extracted_text=text,
-        user_id=current_user.id
-    )
+        upload_result = cloudinary_service.upload_pdf(file.filename, content, MAX_UPLOAD_BYTES)
+        if not upload_result.success:
+            raise HTTPException(
+                status_code=upload_result.status_code,
+                detail={
+                    "error": upload_result.error,
+                    "error_type": upload_result.error_type,
+                },
+            )
 
-    db.add(document)
-    db.commit()
-    db.refresh(document)
+        pages = _extract_validated_pdf_pages(content)
+        text = "\n".join(page.text for page in pages).strip()
 
-    try:
+        if len(text) > settings.rag_max_document_text_length:
+            _cleanup_uploaded_pdf(upload_result.public_id)
+            raise HTTPException(status_code=400, detail=TOO_LARGE_PDF_MESSAGE)
+
+        chunk_count = len(rag_service.chunk_document(pages, document_id=0))
+        if chunk_count > settings.rag_max_document_chunks:
+            _cleanup_uploaded_pdf(upload_result.public_id)
+            raise HTTPException(status_code=400, detail=TOO_LARGE_PDF_MESSAGE)
+
+        document = Document(
+            title=Path(file.filename or upload_result.secure_url or "document.pdf").name,
+            file_path=upload_result.secure_url or "",
+            cloudinary_url=upload_result.secure_url,
+            cloudinary_public_id=upload_result.public_id,
+            file_size=upload_result.file_size,
+            extracted_text=text,
+            user_id=current_user.id
+        )
+
+        db.add(document)
+        db.commit()
+        db.refresh(document)
+
         rag_service.index_document(
             document_id=document.id,
             document_title=document.title,
@@ -159,20 +219,22 @@ async def upload_document(
             status_code=exc.status_code,
             detail=exc.detail,
         ) from exc
+    except HTTPException:
+        if document is None and upload_result and upload_result.public_id:
+            _cleanup_uploaded_pdf(upload_result.public_id)
+        raise
     except Exception as exc:
-        vector_error_type = type(exc).__name__
         try:
-            document_service.delete_document(db, current_user, document.id)
+            if document is not None:
+                document_service.delete_document(db, current_user, document.id)
         except Exception:
             db.rollback()
-            if upload_result.public_id:
-                cloudinary_service.delete_pdf(upload_result.public_id)
+        finally:
+            if upload_result and upload_result.public_id:
+                _cleanup_uploaded_pdf(upload_result.public_id)
         raise HTTPException(
-            status_code=502,
-            detail={
-                "error": "Failed to index document for chat retrieval.",
-                "error_type": vector_error_type,
-            }
+            status_code=500,
+            detail="Something went wrong. Please try again.",
         ) from exc
 
     return {

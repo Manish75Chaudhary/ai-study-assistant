@@ -9,7 +9,7 @@ const STATUS_MESSAGES: Record<number, string> = {
   401: "Invalid email or password.",
   403: "Access denied.",
   404: "Resource not found.",
-  429: "AI service quota has been reached. Please try again later.",
+  429: "AI service is temporarily busy. Please try again in a few minutes.",
   500: "Internal server error.",
   503: "AI service temporarily unavailable.",
 };
@@ -51,20 +51,15 @@ export function getApiErrorMessage(error: unknown) {
     return "Something went wrong. Please try again.";
   }
 
-  const status = error.response?.status;
-
   if (!error.response) {
     return "Server could not be reached";
-  }
-
-  if (status && STATUS_MESSAGES[status]) {
-    return STATUS_MESSAGES[status];
   }
 
   const body = error.response.data;
 
   if (!body) {
-    return error.message || "Something went wrong. Please try again.";
+    const status = error.response.status;
+    return (status && STATUS_MESSAGES[status]) || error.message || "Something went wrong. Please try again.";
   }
 
   if (typeof body === "string") {
@@ -81,6 +76,11 @@ export function getApiErrorMessage(error: unknown) {
 
   if ("detail" in body && typeof body.detail === "string") {
     return body.detail;
+  }
+
+  const status = error.response.status;
+  if (status && STATUS_MESSAGES[status]) {
+    return STATUS_MESSAGES[status];
   }
 
   return error.message || "Something went wrong. Please try again.";

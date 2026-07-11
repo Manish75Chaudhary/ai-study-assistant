@@ -99,7 +99,7 @@ class CloudinaryService:
         if not content.startswith(b"%PDF"):
             return CloudinaryValidationResult(
                 success=False,
-                error="Uploaded file is not a valid PDF",
+                error="This PDF is damaged or unsupported.",
                 error_type="validation_error",
                 status_code=400,
             )
