@@ -10,6 +10,7 @@ from app.models.chat_history import ChatHistory
 from app.models.document import Document
 from app.models.user import User
 from app.services.ai_service import gemini_summary_service
+from app.services.embedding_service import GeminiEmbeddingError
 from app.services.rag_service import rag_service
 
 
@@ -59,6 +60,13 @@ class ChatService:
                 document.id,
                 question,
                 user_id=current_user.id,
+            )
+        except GeminiEmbeddingError as exc:
+            return ChatResult(
+                success=False,
+                error=exc.detail,
+                error_type=exc.error_type,
+                status_code=exc.status_code,
             )
         except Exception as exc:
             logger.exception("Failed to retrieve RAG context", extra={"document_id": document.id, "error_type": type(exc).__name__})

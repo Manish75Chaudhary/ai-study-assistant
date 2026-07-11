@@ -3,6 +3,14 @@ from dataclasses import dataclass
 from app.services.ai_service import gemini_summary_service
 
 
+class GeminiEmbeddingError(RuntimeError):
+    def __init__(self, status_code: int, detail: str, error_type: str | None = None):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+        self.error_type = error_type
+
+
 @dataclass(frozen=True)
 class EmbeddedChunk:
     text: str
@@ -26,7 +34,11 @@ class EmbeddingService:
             user_id=user_id,
         )
         if not result.success or not result.embedding:
-            raise RuntimeError(result.error or "Embedding generation failed.")
+            raise GeminiEmbeddingError(
+                status_code=result.status_code,
+                detail=result.error or "Embedding generation failed.",
+                error_type=result.error_type,
+            )
 
         return result.embedding
 

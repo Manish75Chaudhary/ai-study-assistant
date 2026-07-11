@@ -243,6 +243,15 @@ Context:
 
         return None
 
+    def _is_resource_exhausted_exception(self, exc: Exception, status_code: int | None) -> bool:
+        if status_code == 429:
+            return True
+
+        # Gemini can report quota/rate-limit failures as RESOURCE_EXHAUSTED even when the
+        # HTTP status is not surfaced cleanly, so we treat either signal as a downstream 429
+        # instead of letting it collapse into a misleading gateway error.
+        return "RESOURCE_EXHAUSTED" in str(exc).upper()
+
     def _is_retryable_exception(self, exc: Exception) -> bool:
         if isinstance(exc, (TimeoutError, httpx.TimeoutException, httpx.NetworkError, ConnectionResetError)):
             return True
@@ -267,13 +276,13 @@ Context:
             return "network_error", 503, GEMINI_UNAVAILABLE_MESSAGE
 
         if isinstance(exc, errors.ServerError):
-            return "gemini_api_error", 503, GEMINI_UNAVAILABLE_MESSAGE
+            return "gemini_api_error", status_code or 503, GEMINI_UNAVAILABLE_MESSAGE
 
         if isinstance(exc, (errors.ClientError, errors.APIError)):
-            if status_code == 429:
+            if self._is_resource_exhausted_exception(exc, status_code):
                 return "quota_exhausted", 429, GEMINI_QUOTA_MESSAGE
 
-            return "gemini_api_error", 500, GEMINI_UNEXPECTED_MESSAGE
+            return "gemini_api_error", status_code or 500, GEMINI_UNEXPECTED_MESSAGE
 
         return "gemini_api_error", 500, GEMINI_UNEXPECTED_MESSAGE
 
@@ -298,6 +307,10 @@ Context:
         }
         if attempt is not None:
             log_extra["attempt"] = attempt
+
+        if status_code == 429:
+            logger.warning("Gemini request rate-limited", extra=log_extra)
+            return
 
         logger.exception("Gemini request failed", extra=log_extra)
 

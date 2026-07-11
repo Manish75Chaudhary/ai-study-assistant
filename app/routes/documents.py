@@ -19,6 +19,7 @@ from app.schemas.document_schema import (
 from app.services.cloudinary_service import cloudinary_service
 from app.services.chat_service import chat_service
 from app.services.ai_service import gemini_summary_service
+from app.services.embedding_service import GeminiEmbeddingError
 from app.services.document_service import document_service
 from app.services.pdf_service import extract_pages_from_pdf
 from app.services.rag_service import DocumentPage, rag_service
@@ -153,6 +154,11 @@ async def upload_document(
             ],
             user_id=current_user.id,
         )
+    except GeminiEmbeddingError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+        ) from exc
     except Exception as exc:
         vector_error_type = type(exc).__name__
         try:
