@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Path as ApiPath, Query, UploadFile
@@ -27,7 +28,16 @@ router = APIRouter(
     tags=["Documents"]
 )
 
+logger = logging.getLogger(__name__)
+
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+GEMINI_ERROR_TYPES = {
+    "quota_exhausted",
+    "timeout_error",
+    "network_error",
+    "gemini_api_error",
+    "empty_response",
+}
 
 
 @router.get("", response_model=list[DocumentListItem])
@@ -140,7 +150,8 @@ async def upload_document(
                     text=page.text,
                 )
                 for page in pages
-            ]
+            ],
+            user_id=current_user.id,
         )
     except Exception as exc:
         vector_error_type = type(exc).__name__
@@ -192,20 +203,52 @@ def summarize_document(
             detail="Document does not contain extracted text"
         )
 
+    if document.summary and document.summary.strip():
+        logger.info(
+            "Returning cached summary",
+            extra={
+                "document_id": document.id,
+                "user_id": current_user.id,
+            },
+        )
+        return {
+            "message": "Summary generated successfully",
+            "document_id": document.id,
+            "summary": document.summary,
+        }
+
+    logger.info(
+        "Generating new summary",
+        extra={
+            "document_id": document.id,
+            "user_id": current_user.id,
+        },
+    )
+
     result = gemini_summary_service.generate_summary(
         document.extracted_text,
-        document.title
+        document.title,
+        endpoint="POST /documents/{document_id}/summarize",
+        user_id=current_user.id,
     )
 
     if not result.success:
+        detail = result.error if result.error_type in GEMINI_ERROR_TYPES else {
+            "error": result.error,
+            "error_type": result.error_type,
+        }
         raise HTTPException(
             status_code=result.status_code,
-            detail={
-                "error": result.error,
-                "error_type": result.error_type,
-            }
+            detail=detail,
         )
 
+    logger.info(
+        "Saving summary to database",
+        extra={
+            "document_id": document.id,
+            "user_id": current_user.id,
+        },
+    )
     document.summary = result.summary
     db.add(document)
     db.commit()
@@ -237,12 +280,13 @@ def chat_with_document(
     )
 
     if not result.success:
+        detail = result.error if result.error_type in GEMINI_ERROR_TYPES else {
+            "error": result.error,
+            "error_type": result.error_type,
+        }
         raise HTTPException(
             status_code=result.status_code,
-            detail={
-                "error": result.error,
-                "error_type": result.error_type,
-            }
+            detail=detail,
         )
 
     return {

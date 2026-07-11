@@ -5,6 +5,15 @@ import axios, { AxiosError } from "axios";
 import { API_BASE_URL, TOKEN_STORAGE_KEY } from "@/lib/constants";
 import type { ApiErrorBody } from "@/types/api";
 
+const STATUS_MESSAGES: Record<number, string> = {
+  401: "Invalid email or password.",
+  403: "Access denied.",
+  404: "Resource not found.",
+  429: "AI service quota has been reached. Please try again later.",
+  500: "Internal server error.",
+  503: "AI service temporarily unavailable.",
+};
+
 export const apiClient = axios.create({
   baseURL: API_BASE_URL,
   timeout: 240000,
@@ -42,9 +51,20 @@ export function getApiErrorMessage(error: unknown) {
     return "Something went wrong. Please try again.";
   }
 
-  const body = error.response?.data;
+  const status = error.response?.status;
+
+  if (!error.response) {
+    return "Server could not be reached";
+  }
+
+  if (status && STATUS_MESSAGES[status]) {
+    return STATUS_MESSAGES[status];
+  }
+
+  const body = error.response.data;
+
   if (!body) {
-    return "The server could not be reached. Check that the backend is running.";
+    return error.message || "Something went wrong. Please try again.";
   }
 
   if (typeof body === "string") {
@@ -63,5 +83,5 @@ export function getApiErrorMessage(error: unknown) {
     return body.detail;
   }
 
-  return error.message;
+  return error.message || "Something went wrong. Please try again.";
 }

@@ -55,7 +55,11 @@ class ChatService:
             return ChatResult(success=False, error="Document does not contain extracted text", error_type="validation_error", status_code=400)
 
         try:
-            context_chunks = rag_service.retrieve_relevant_chunks(document.id, question)
+            context_chunks = rag_service.retrieve_relevant_chunks(
+                document.id,
+                question,
+                user_id=current_user.id,
+            )
         except Exception as exc:
             logger.exception("Failed to retrieve RAG context", extra={"document_id": document.id, "error_type": type(exc).__name__})
             return ChatResult(success=False, error="Failed to retrieve relevant document chunks", error_type="retrieval_error", status_code=502)
@@ -73,6 +77,8 @@ class ChatService:
             question=question,
             document_title=document.title,
             context_blocks=context_chunks,
+            endpoint="POST /documents/{document_id}/chat",
+            user_id=current_user.id,
         )
 
         if not result.success or not result.answer:

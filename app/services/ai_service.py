@@ -12,6 +12,10 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+GEMINI_QUOTA_MESSAGE = "AI service quota has been reached. Please try again later."
+GEMINI_UNAVAILABLE_MESSAGE = "AI service is temporarily unavailable."
+GEMINI_UNEXPECTED_MESSAGE = "Unexpected AI service error."
+
 
 @dataclass(frozen=True)
 class SummaryResult:
@@ -226,15 +230,79 @@ Context:
         first_embedding = embeddings[0]
         return list(getattr(first_embedding, "values", []) or [])
 
-    def _is_transient_exception(self, exc: Exception) -> bool:
-        if isinstance(exc, (TimeoutError, httpx.TimeoutException, httpx.NetworkError)):
+    def _extract_status_code(self, exc: Exception) -> int | None:
+        for attr_name in ("status_code", "code", "status"):
+            value = getattr(exc, attr_name, None)
+            if isinstance(value, int):
+                return value
+
+            for nested_attr in ("status_code", "code"):
+                nested_value = getattr(value, nested_attr, None)
+                if isinstance(nested_value, int):
+                    return nested_value
+
+        return None
+
+    def _is_retryable_exception(self, exc: Exception) -> bool:
+        if isinstance(exc, (TimeoutError, httpx.TimeoutException, httpx.NetworkError, ConnectionResetError)):
             return True
 
-        if isinstance(exc, (errors.ServerError, errors.APIError)):
-            status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-            return status_code in {429, 500, 502, 503, 504}
+        if isinstance(exc, errors.ServerError):
+            status_code = self._extract_status_code(exc)
+            return status_code is None or status_code >= 500
+
+        if isinstance(exc, errors.APIError):
+            status_code = self._extract_status_code(exc)
+            return status_code in {500, 502, 503, 504}
 
         return False
+
+    def _classify_gemini_exception(self, exc: Exception) -> tuple[str, int, str]:
+        status_code = self._extract_status_code(exc)
+
+        if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
+            return "timeout_error", 503, GEMINI_UNAVAILABLE_MESSAGE
+
+        if isinstance(exc, (httpx.NetworkError, ConnectionResetError)):
+            return "network_error", 503, GEMINI_UNAVAILABLE_MESSAGE
+
+        if isinstance(exc, errors.ServerError):
+            return "gemini_api_error", 503, GEMINI_UNAVAILABLE_MESSAGE
+
+        if isinstance(exc, (errors.ClientError, errors.APIError)):
+            if status_code == 429:
+                return "quota_exhausted", 429, GEMINI_QUOTA_MESSAGE
+
+            return "gemini_api_error", 500, GEMINI_UNEXPECTED_MESSAGE
+
+        return "gemini_api_error", 500, GEMINI_UNEXPECTED_MESSAGE
+
+    def _log_gemini_failure(
+        self,
+        *,
+        endpoint: str,
+        model: str,
+        exc: Exception,
+        status_code: int,
+        user_id: int | None,
+        retryable: bool,
+        attempt: int | None = None,
+    ) -> None:
+        log_extra = {
+            "endpoint": endpoint,
+            "model": model,
+            "exception_type": type(exc).__name__,
+            "status_code": status_code,
+            "user_id": user_id,
+            "retryable": retryable,
+        }
+        if attempt is not None:
+            log_extra["attempt"] = attempt
+
+        logger.exception("Gemini request failed", extra=log_extra)
+
+    def _build_failure_result(self, exc: Exception) -> tuple[str, int, str]:
+        return self._classify_gemini_exception(exc)
 
     def _call_gemini(
         self,
@@ -242,8 +310,10 @@ Context:
         max_output_tokens: int = 1600,
         thinking_budget: int | None = None,
         generation_type: str = "summary",
+        endpoint: str | None = None,
+        user_id: int | None = None,
     ) -> SummaryResult:
-        last_error: Exception | None = None
+        endpoint_name = endpoint or generation_type
 
         for attempt in range(1, self.settings.max_attempts + 1):
             try:
@@ -275,27 +345,28 @@ Context:
                 if not summary.strip():
                     return SummaryResult(
                         success=False,
-                        error="Gemini returned an empty summary.",
+                        error=GEMINI_UNEXPECTED_MESSAGE,
                         error_type="empty_response",
-                        status_code=502,
+                        status_code=500,
                     )
 
                 return SummaryResult(success=True, summary=summary.strip())
             except Exception as exc:
-                last_error = exc
-                if not self._is_transient_exception(exc) or attempt == self.settings.max_attempts:
-                    logger.exception(
-                        "Gemini API request failed",
-                        extra={
-                            "model": self.settings.model_name,
-                            "error_type": type(exc).__name__,
-                        },
+                error_type, status_code, message = self._build_failure_result(exc)
+                retryable = self._is_retryable_exception(exc)
+                if not retryable or attempt == self.settings.max_attempts:
+                    self._log_gemini_failure(
+                        endpoint=endpoint_name,
+                        model=self.settings.model_name,
+                        exc=exc,
+                        status_code=status_code,
+                        user_id=user_id,
+                        retryable=retryable,
+                        attempt=attempt,
                     )
-                    error_type = "timeout_error" if isinstance(exc, (TimeoutError, httpx.TimeoutException)) else "gemini_api_error"
-                    status_code = 504 if error_type == "timeout_error" else 502
                     return SummaryResult(
                         success=False,
-                        error="Gemini request failed.",
+                        error=message,
                         error_type=error_type,
                         status_code=status_code,
                     )
@@ -304,26 +375,15 @@ Context:
                 logger.warning(
                     "Retrying transient Gemini failure",
                     extra={
+                        "endpoint": endpoint_name,
                         "model": self.settings.model_name,
                         "attempt": attempt,
-                        "error_type": type(exc).__name__,
+                        "exception_type": type(exc).__name__,
+                        "status_code": status_code,
+                        "user_id": user_id,
                     },
                 )
                 time.sleep(sleep_seconds)
-
-        logger.exception(
-            "Gemini API request failed after retries",
-            extra={
-                "model": self.settings.model_name,
-                "error_type": type(last_error).__name__ if last_error else "unknown",
-            },
-        )
-        return SummaryResult(
-            success=False,
-            error="Gemini request failed.",
-            error_type="gemini_api_error",
-            status_code=502,
-        )
 
     def _log_generation_diagnostics(
         self,
@@ -352,12 +412,20 @@ Context:
         logger.debug("Gemini %s prompt:\n%s", generation_type, prompt)
         logger.debug("Gemini %s raw text:\n%s", generation_type, output_text)
 
-    def _call_answer_model(self, prompt: str, max_output_tokens: int = 3000) -> AnswerResult:
+    def _call_answer_model(
+        self,
+        prompt: str,
+        max_output_tokens: int = 3000,
+        endpoint: str | None = None,
+        user_id: int | None = None,
+    ) -> AnswerResult:
         text_result = self._call_gemini(
             prompt,
             max_output_tokens=max_output_tokens,
             thinking_budget=0,
             generation_type="chat",
+            endpoint=endpoint,
+            user_id=user_id,
         )
         if not text_result.success:
             return AnswerResult(
@@ -377,6 +445,8 @@ Context:
         text: str,
         title: str | None = None,
         task_type: str = "retrieval_document",
+        endpoint: str | None = None,
+        user_id: int | None = None,
     ) -> EmbeddingResult:
         if not text or not text.strip():
             return EmbeddingResult(
@@ -395,7 +465,6 @@ Context:
                 status_code=config_status.status_code,
             )
 
-        last_error: Exception | None = None
         for attempt in range(1, self.settings.max_attempts + 1):
             try:
                 client = self._build_client()
@@ -412,27 +481,28 @@ Context:
                 if not embedding:
                     return EmbeddingResult(
                         success=False,
-                        error="Gemini returned an empty embedding.",
+                        error=GEMINI_UNEXPECTED_MESSAGE,
                         error_type="empty_response",
-                        status_code=502,
+                        status_code=500,
                     )
 
                 return EmbeddingResult(success=True, embedding=embedding)
             except Exception as exc:
-                last_error = exc
-                if not self._is_transient_exception(exc) or attempt == self.settings.max_attempts:
-                    logger.exception(
-                        "Gemini embedding request failed",
-                        extra={
-                            "model": self.settings.embedding_model_name,
-                            "error_type": type(exc).__name__,
-                        },
+                error_type, status_code, message = self._build_failure_result(exc)
+                retryable = self._is_retryable_exception(exc)
+                if not retryable or attempt == self.settings.max_attempts:
+                    self._log_gemini_failure(
+                        endpoint=endpoint or f"embedding:{task_type}",
+                        model=self.settings.embedding_model_name,
+                        exc=exc,
+                        status_code=status_code,
+                        user_id=user_id,
+                        retryable=retryable,
+                        attempt=attempt,
                     )
-                    error_type = "timeout_error" if isinstance(exc, (TimeoutError, httpx.TimeoutException)) else "gemini_api_error"
-                    status_code = 504 if error_type == "timeout_error" else 502
                     return EmbeddingResult(
                         success=False,
-                        error="Gemini embedding request failed.",
+                        error=message,
                         error_type=error_type,
                         status_code=status_code,
                     )
@@ -440,28 +510,23 @@ Context:
                 logger.warning(
                     "Retrying transient Gemini embedding failure",
                     extra={
+                        "endpoint": endpoint or f"embedding:{task_type}",
                         "model": self.settings.embedding_model_name,
                         "attempt": attempt,
-                        "error_type": type(exc).__name__,
+                        "exception_type": type(exc).__name__,
+                        "status_code": status_code,
+                        "user_id": user_id,
                     },
                 )
                 time.sleep(0.5 * attempt)
 
-        logger.exception(
-            "Gemini embedding request failed after retries",
-            extra={
-                "model": self.settings.embedding_model_name,
-                "error_type": type(last_error).__name__ if last_error else "unknown",
-            },
-        )
-        return EmbeddingResult(
-            success=False,
-            error="Gemini embedding request failed.",
-            error_type="gemini_api_error",
-            status_code=502,
-        )
-
-    def generate_answer(self, prompt: str, max_output_tokens: int = 800) -> AnswerResult:
+    def generate_answer(
+        self,
+        prompt: str,
+        max_output_tokens: int = 800,
+        endpoint: str | None = None,
+        user_id: int | None = None,
+    ) -> AnswerResult:
         if not prompt or not prompt.strip():
             return AnswerResult(
                 success=False,
@@ -479,9 +544,20 @@ Context:
                 status_code=config_status.status_code,
             )
 
-        return self._call_answer_model(prompt, max_output_tokens=max_output_tokens)
+        return self._call_answer_model(
+            prompt,
+            max_output_tokens=max_output_tokens,
+            endpoint=endpoint,
+            user_id=user_id,
+        )
 
-    def generate_summary(self, extracted_text: str, document_title: str) -> SummaryResult:
+    def generate_summary(
+        self,
+        extracted_text: str,
+        document_title: str,
+        endpoint: str | None = None,
+        user_id: int | None = None,
+    ) -> SummaryResult:
         if not extracted_text or not extracted_text.strip():
             return SummaryResult(
                 success=False,
@@ -498,7 +574,9 @@ Context:
 
         if len(chunks) == 1:
             return self._call_gemini(
-                self._build_prompt(chunks[0], document_title)
+                self._build_prompt(chunks[0], document_title),
+                endpoint=endpoint,
+                user_id=user_id,
             )
 
         partial_summaries: list[str] = []
@@ -506,6 +584,8 @@ Context:
             chunk_result = self._call_gemini(
                 f"Document title: {document_title}\nChunk {index} of {len(chunks)}\n\n{self._build_prompt(chunk, document_title)}",
                 max_output_tokens=1200,
+                endpoint=endpoint,
+                user_id=user_id,
             )
 
             if not chunk_result.success or not chunk_result.summary:
@@ -516,6 +596,8 @@ Context:
         return self._call_gemini(
             self._build_merge_prompt(partial_summaries, document_title),
             max_output_tokens=2000,
+            endpoint=endpoint,
+            user_id=user_id,
         )
 
     def answer_from_context(
@@ -523,6 +605,8 @@ Context:
         question: str,
         document_title: str,
         context_blocks: list[dict],
+        endpoint: str | None = None,
+        user_id: int | None = None,
     ) -> AnswerResult:
         if not question or not question.strip():
             return AnswerResult(
@@ -539,7 +623,12 @@ Context:
             )
 
         prompt = self._build_rag_prompt(question, document_title, context_blocks)
-        result = self.generate_answer(prompt, max_output_tokens=3000)
+        result = self.generate_answer(
+            prompt,
+            max_output_tokens=3000,
+            endpoint=endpoint,
+            user_id=user_id,
+        )
         if result.success and result.answer:
             return result
 

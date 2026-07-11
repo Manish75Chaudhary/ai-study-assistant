@@ -117,7 +117,13 @@ class RagService:
                 )
         return chunks
 
-    def index_document(self, document_id: int, document_title: str, pages: list[DocumentPage]) -> int:
+    def index_document(
+        self,
+        document_id: int,
+        document_title: str,
+        pages: list[DocumentPage],
+        user_id: int | None = None,
+    ) -> int:
         if vector_store.has_document_chunks(document_id):
             logger.info("Reusing existing embeddings for document %s", document_id)
             return 0
@@ -132,6 +138,8 @@ class RagService:
                 chunk.chunk_text,
                 title=document_title,
                 task_type="retrieval_document",
+                endpoint="POST /documents/upload",
+                user_id=user_id,
             )
             indexed_chunks.append(
                 {
@@ -150,10 +158,18 @@ class RagService:
         logger.info("Indexed %s chunks for document %s", len(indexed_chunks), document_id)
         return len(indexed_chunks)
 
-    def retrieve_relevant_chunks(self, document_id: int, question: str, top_k: int | None = None) -> list[dict]:
+    def retrieve_relevant_chunks(
+        self,
+        document_id: int,
+        question: str,
+        top_k: int | None = None,
+        user_id: int | None = None,
+    ) -> list[dict]:
         query_embedding = embedding_service.embed_text(
             question,
             task_type="retrieval_query",
+            endpoint="POST /documents/{document_id}/chat",
+            user_id=user_id,
         )
         return vector_store.query_document_chunks(
             document_id=document_id,
