@@ -33,10 +33,11 @@ router = APIRouter(
 logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MIN_EXTRACTABLE_TEXT_LENGTH = 50
 UNSUPPORTED_PDF_MESSAGE = "This PDF is damaged or unsupported."
 PASSWORD_PROTECTED_PDF_MESSAGE = "This PDF is password protected."
-EMPTY_PDF_MESSAGE = "This PDF contains no readable text."
-SCANNED_PDF_MESSAGE = "This PDF appears to be scanned or image-based. Please upload a text-based PDF."
+EMPTY_PDF_MESSAGE = "This PDF does not contain enough readable text. Please upload a text-based PDF."
+SCANNED_PDF_MESSAGE = "This PDF appears to be scanned, handwritten, or image-based and does not contain enough extractable text. Please upload a text-based PDF."
 TOO_LARGE_PDF_MESSAGE = "This document is too large to process. Please upload a smaller PDF."
 GEMINI_ERROR_TYPES = {
     "quota_exhausted",
@@ -85,7 +86,8 @@ def _extract_validated_pdf_pages(content: bytes) -> list[DocumentPage]:
             has_text = has_text or bool(page_text)
             has_images = has_images or bool(page_images)
 
-        if not pages or not has_text:
+        all_text = " ".join(p.text for p in pages)
+        if len(all_text.strip()) < MIN_EXTRACTABLE_TEXT_LENGTH:
             raise HTTPException(
                 status_code=400,
                 detail=SCANNED_PDF_MESSAGE if has_images else EMPTY_PDF_MESSAGE,
@@ -166,6 +168,11 @@ async def upload_document(
                 },
             )
 
+        # Extract and validate text BEFORE uploading to Cloudinary so scanned/
+        # image-based PDFs are rejected fast without wasting cloud storage.
+        pages = _extract_validated_pdf_pages(content)
+        text = "\n".join(page.text for page in pages).strip()
+
         upload_result = cloudinary_service.upload_pdf(file.filename, content, MAX_UPLOAD_BYTES)
         if not upload_result.success:
             raise HTTPException(
@@ -175,9 +182,6 @@ async def upload_document(
                     "error_type": upload_result.error_type,
                 },
             )
-
-        pages = _extract_validated_pdf_pages(content)
-        text = "\n".join(page.text for page in pages).strip()
 
         if len(text) > settings.rag_max_document_text_length:
             _cleanup_uploaded_pdf(upload_result.public_id)
@@ -224,6 +228,13 @@ async def upload_document(
             _cleanup_uploaded_pdf(upload_result.public_id)
         raise
     except Exception as exc:
+        logger.exception(
+            "Document upload failed",
+            extra={
+                "endpoint": "POST /documents/upload",
+                "error_type": type(exc).__name__,
+            },
+        )
         try:
             if document is not None:
                 document_service.delete_document(db, current_user, document.id)
